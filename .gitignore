@@ -1,0 +1,27 @@
+# Variáveis de ambiente — NUNCA suba isso
+.env
+.env.*
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Ambientes virtuais
+venv/
+.venv/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# Arquivos temporários de imagem
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.gif
+tmp/
+temp/
