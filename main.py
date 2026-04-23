@@ -36,65 +36,93 @@ def _decode_from_array(arr: np.ndarray) -> list[str]:
     return [r.data.decode("utf-8") for r in decode(pil)]
 
 
+def _get_slices(img_cv: np.ndarray) -> list[np.ndarray]:
+    """
+    Return the full image plus overlapping horizontal slices.
+    This ensures QRs that appear in different vertical regions of the photo
+    (e.g. two stacked cartelas) are each given a clean crop to be decoded.
+    """
+    h = img_cv.shape[0]
+    ratios = [
+        (0.0,  1.0),   # full image
+        (0.0,  0.5),   # top half
+        (0.5,  1.0),   # bottom half
+        (0.0,  0.4),
+        (0.3,  0.7),   # middle overlap
+        (0.4,  0.8),
+        (0.6,  1.0),
+    ]
+    return [img_cv[int(h * a):int(h * b), :] for a, b in ratios if int(h * b) > int(h * a)]
+
+
 def _try_all_strategies(img_cv: np.ndarray) -> list[str]:
     """
-    Apply several preprocessing strategies to maximise detection on
-    low-resolution or badly-lit photos.
+    Apply several preprocessing strategies across multiple image regions.
+
+    IMPORTANT: ALL strategies always run on ALL regions; results are deduplicated.
+    - Same QR found by multiple strategies/regions  → counted as ONE
+    - Two genuinely different QRs in the image      → counted as TWO (→ MULTIPLE_QRCODES)
     """
-    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    seen: set[str] = set()
 
-    strategies = [
-        # 1. Raw grayscale
-        lambda g: g,
-        # 2. Gaussian blur to reduce noise
-        lambda g: cv2.GaussianBlur(g, (3, 3), 0),
-        # 3. Otsu binarisation
-        lambda g: cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
-        # 4. Adaptive threshold
-        lambda g: cv2.adaptiveThreshold(
-            g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-        ),
-        # 5. Sharpen then Otsu
-        lambda g: cv2.threshold(
-            cv2.filter2D(
-                g, -1,
-                np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
+    for region in _get_slices(img_cv):
+        if region.size == 0:
+            continue
+        try:
+            gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+        except Exception:
+            continue
+
+        preprocessors = [
+            lambda g: g,
+            lambda g: cv2.GaussianBlur(g, (3, 3), 0),
+            lambda g: cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
+            lambda g: cv2.adaptiveThreshold(
+                g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
             ),
-            0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )[1],
-        # 6. Upscale 2× then Otsu (helps very small QR codes)
-        lambda g: cv2.threshold(
-            cv2.resize(g, (g.shape[1] * 2, g.shape[0] * 2), interpolation=cv2.INTER_CUBIC),
-            0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )[1],
-    ]
+            lambda g: cv2.threshold(
+                cv2.filter2D(g, -1, np.array([[-1,-1,-1],[-1,9,-1],[-1,-1,-1]])),
+                0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )[1],
+            lambda g: cv2.threshold(
+                cv2.resize(g, (g.shape[1] * 2, g.shape[0] * 2), interpolation=cv2.INTER_CUBIC),
+                0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )[1],
+        ]
 
-    for fn in strategies:
-        processed = fn(gray)
-        found = _decode_from_array(processed)
-        if found:
-            return found
+        for fn in preprocessors:
+            try:
+                for value in _decode_from_array(fn(gray)):
+                    seen.add(value)
+            except Exception:
+                pass
 
-    return []
+    return list(seen)
 
 
 def extract_qr_codes(image_path: str) -> list[str]:
-    """Return a list of decoded QR code strings from an image file."""
+    """
+    Return a deduplicated list of QR code strings found in the image.
+    Combines results from direct PIL decoding and the OpenCV pipeline so
+    that the same QR detected by multiple methods is counted only once.
+    """
+    found: set[str] = set()
+
     # --- attempt 1: direct PIL (fastest, works on clean images) ---
     try:
         pil_img = Image.open(image_path)
-        results = decode(pil_img)
-        if results:
-            return [r.data.decode("utf-8") for r in results]
+        for r in decode(pil_img):
+            found.add(r.data.decode("utf-8"))
     except Exception:
         pass
 
     # --- attempt 2: OpenCV preprocessing pipeline ---
     img_cv = cv2.imread(image_path)
-    if img_cv is None:
-        return []
+    if img_cv is not None:
+        for value in _try_all_strategies(img_cv):
+            found.add(value)
 
-    return _try_all_strategies(img_cv)
+    return list(found)
 
 
 # ---------------------------------------------------------------------------
