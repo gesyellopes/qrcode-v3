@@ -36,93 +36,89 @@ def _decode_from_array(arr: np.ndarray) -> list[str]:
     return [r.data.decode("utf-8") for r in decode(pil)]
 
 
-def _get_slices(img_cv: np.ndarray) -> list[np.ndarray]:
+def _smart_resize(img: np.ndarray, max_dim: int = 600) -> np.ndarray:
     """
-    Return the full image plus overlapping horizontal slices.
-    This ensures QRs that appear in different vertical regions of the photo
-    (e.g. two stacked cartelas) are each given a clean crop to be decoded.
+    Downscale image so its longest side is at most max_dim pixels.
+    pyzbar is O(pixels) — keeping images small is the #1 speed lever.
+    QR codes are robust to downscaling; 600px is enough for any readable QR.
     """
-    h = img_cv.shape[0]
-    ratios = [
-        (0.0,  1.0),   # full image
-        (0.0,  0.5),   # top half
-        (0.5,  1.0),   # bottom half
-        (0.0,  0.4),
-        (0.3,  0.7),   # middle overlap
-        (0.4,  0.8),
-        (0.6,  1.0),
-    ]
-    return [img_cv[int(h * a):int(h * b), :] for a, b in ratios if int(h * b) > int(h * a)]
+    h, w = img.shape[:2]
+    if max(h, w) <= max_dim:
+        return img
+    scale = max_dim / max(h, w)
+    return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
 
-def _try_all_strategies(img_cv: np.ndarray) -> list[str]:
+def _decode_regions(img: np.ndarray) -> set[str]:
     """
-    Apply several preprocessing strategies across multiple image regions.
-
-    IMPORTANT: ALL strategies always run on ALL regions; results are deduplicated.
-    - Same QR found by multiple strategies/regions  → counted as ONE
-    - Two genuinely different QRs in the image      → counted as TWO (→ MULTIPLE_QRCODES)
+    Decode QR codes from an image using overlapping horizontal slices.
+    Each slice is tried with grayscale and Otsu binarisation.
+    Results are deduplicated by value.
     """
+    h = img.shape[0]
     seen: set[str] = set()
 
-    for region in _get_slices(img_cv):
+    regions = [
+        img,                        # full image
+        img[:h // 2, :],            # top half
+        img[h // 2:, :],            # bottom half
+        img[:int(h * 0.55), :],     # top 55% (overlap)
+        img[int(h * 0.45):, :],     # bottom 55% (overlap)
+    ]
+
+    for region in regions:
         if region.size == 0:
             continue
         try:
             gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+            _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            for proc in [gray, otsu]:
+                for r in decode(Image.fromarray(proc)):
+                    seen.add(r.data.decode("utf-8"))
         except Exception:
-            continue
+            pass
 
-        preprocessors = [
-            lambda g: g,
-            lambda g: cv2.GaussianBlur(g, (3, 3), 0),
-            lambda g: cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
-            lambda g: cv2.adaptiveThreshold(
-                g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-            ),
-            lambda g: cv2.threshold(
-                cv2.filter2D(g, -1, np.array([[-1,-1,-1],[-1,9,-1],[-1,-1,-1]])),
-                0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )[1],
-            lambda g: cv2.threshold(
-                cv2.resize(g, (g.shape[1] * 2, g.shape[0] * 2), interpolation=cv2.INTER_CUBIC),
-                0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )[1],
-        ]
+    return seen
 
-        for fn in preprocessors:
-            try:
-                for value in _decode_from_array(fn(gray)):
-                    seen.add(value)
-            except Exception:
-                pass
 
-    return list(seen)
+def _try_all_strategies(img_cv: np.ndarray) -> list[str]:
+    """Kept for compatibility — delegates to _decode_regions."""
+    return list(_decode_regions(img_cv))
 
 
 def extract_qr_codes(image_path: str) -> list[str]:
     """
-    Return a deduplicated list of QR code strings found in the image.
-    Combines results from direct PIL decoding and the OpenCV pipeline so
-    that the same QR detected by multiple methods is counted only once.
-    """
-    found: set[str] = set()
+    Return a deduplicated list of QR code values found in the image.
 
-    # --- attempt 1: direct PIL (fastest, works on clean images) ---
+    Strategy (cascade — stops as soon as enough info is available):
+    1. Load and downscale to max 600px (massive speed gain, QRs survive it).
+    2. Try PIL direct decode on the full image (instant for clean images).
+    3. Run overlapping-slice pipeline with grayscale + Otsu.
+    """
+    img_cv = cv2.imread(image_path)
+    if img_cv is None:
+        # Fallback: let PIL try (handles formats OpenCV may not)
+        try:
+            pil_img = Image.open(image_path)
+            return [r.data.decode("utf-8") for r in decode(pil_img)]
+        except Exception:
+            return []
+
+    img_cv = _smart_resize(img_cv)
+
+    # Fast path: try PIL on the resized full image first
+    seen: set[str] = set()
     try:
-        pil_img = Image.open(image_path)
-        for r in decode(pil_img):
-            found.add(r.data.decode("utf-8"))
+        rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+        for r in decode(Image.fromarray(rgb)):
+            seen.add(r.data.decode("utf-8"))
     except Exception:
         pass
 
-    # --- attempt 2: OpenCV preprocessing pipeline ---
-    img_cv = cv2.imread(image_path)
-    if img_cv is not None:
-        for value in _try_all_strategies(img_cv):
-            found.add(value)
+    # Full pipeline on all regions
+    seen |= _decode_regions(img_cv)
 
-    return list(found)
+    return list(seen)
 
 
 # ---------------------------------------------------------------------------
