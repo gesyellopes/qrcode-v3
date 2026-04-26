@@ -181,20 +181,20 @@ def read_qr(image_id: str):
 
         if not codes:
             return JSONResponse(
-                content={"success": False, "error": "NO_QRCODE"},
+                content={"success": False, "reason": "NO_QRCODE"},
                 status_code=200,
             )
 
         if len(codes) > 1:
             return JSONResponse(
-                content={"success": False, "error": "MULTIPLE_QRCODES"},
+                content={"success": False, "reason": "MULTIPLE_QRCODES"},
                 status_code=200,
             )
 
         ticket_id = codes[0].strip()
         if not ticket_id:
             return JSONResponse(
-                content={"success": False, "error": "EMPTY_QRCODE"},
+                content={"success": False, "reason": "EMPTY_QRCODE"},
                 status_code=200,
             )
 
